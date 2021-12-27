@@ -5,16 +5,13 @@ import * as path from 'path';
 import { readdir, readFile, access } from 'fs/promises';
 import fetchStats, { filter as filterStats } from '../../npm-version-download-stats/src/index.js';
 import { sumDownloads } from '../../npm-version-download-stats/src/utils.js';
-
-
-const PLUGINS_DIR = '../opentelemetry-js-contrib/plugins/node/';
-console.log('path.resolve()', path.resolve(PLUGINS_DIR));
+import yaml from 'js-yaml';
 
 const SUPPORTED_VERSIONS = Symbol('SUPPORTED_VERSIONS');
 const INSTRUMENTED_PACKAGE_NAME = Symbol('INSTRUMENTED_PACKAGE_NAME');
 const FETCH_STATS = Symbol('FETCH_STATS');
+const TESTED_VERSION = Symbol('TESTED_VERSION');
 const should = (pkgName, key) => {
-
 	if (key === SUPPORTED_VERSIONS) {
 		if (~[
 				'@opentelemetry/instrumentation-aws-lambda',
@@ -71,6 +68,10 @@ const getSupportedVersionSection = (readmeContents) => {
 	const isWinston = /`1\.x`, `2\.x`, `3\.x`/.test(readmeContents);
 	if (isWinston) {
 		return '>=1 <4';
+	}
+	const isOldGraphQL = /Minimum required graphql version is `v14`/.test(readmeContents);
+	if (isOldGraphQL) {
+		return '>=14';
 	}
 	const match = readmeContents.match(/#+ Supported Versions\n([^#]+)/i);
 	assert(match && match[1], 'Could not find supported versions section:\n' + readmeContents);
@@ -131,103 +132,113 @@ const fileExists = (filePath) => {
 		});
 };
 const checkTav = async (root, packageJson) => {
-	const hasTavConfig = await fileExists(path.join(root, './.tav.yml'));
-	const tavVersion = packageJson.devDependencies['test-all-versions'];
-	const tavScript = packageJson.scripts['test-all-versions'];
+	const config = await readFile(path.join(root, '.tav.yml'))
+		.then((content) => yaml.load(content))
+		.catch((err) => {
+			assert.equal(err.code, 'ENOENT', err);
+			return null;
+		});
+	const tavVersion = packageJson?.devDependencies['test-all-versions'];
+	const script = packageJson?.scripts['test-all-versions'];
+
 	return {
-		valid: !!(hasTavConfig && tavVersion && tavScript),
-		hasTavConfig,
+		valid: !!(config && tavVersion && script),
+		config,
 		tavVersion,
-		tavScript,
+		script,
 	};
+};
+const getTestedVersionsFromTavConfig = (packageName, config) => {
+	assert.equal(typeof config, 'object');
+	assert.equal(typeof packageName, 'string');
+	const { [packageName]: packageConfig } = config;
+	if (typeof packageConfig === 'object' && packageConfig.versions) {
+		return packageConfig.versions;
+	}
+	if (Array.isArray(packageConfig) && packageConfig.length && packageConfig[0].versions) {
+		return packageConfig.map((el) => el.versions.trim()).join(' || ');
+	}
+	assert.fail(`Unable to parse tested versions from tav config: ${util.inspect(config)}`);
 };
 const readJson = (...args) => {
 	return readFile(...args).then(JSON.parse);
 };
-const compileVersionStats = async (packageName, semverRange) => {
-	assert.equal(typeof packageName, 'string');
-	assert.equal(typeof semverRange, 'string');
-	let stats = await fetchStats(packageName).catch((err) => {
-		err.packageName = packageName;
-		throw err;
-	});
+const eatError = (err) => {
+	console.error(err);
+	return null;
+};
+const getTestedVersions = (name, packageJson, tavConfig) => {
+	assert.equal(typeof name, 'string');
+	assert.equal(typeof tavConfig, 'object');
+	assert.equal(typeof packageJson, 'object');
+	assert.equal(util.types.isPromise(tavConfig), false);
+	assert.equal(util.types.isPromise(packageJson), false);
 
-	const sum = sumDownloads(stats);
-	stats = stats.map((entry) => {
-			return {
-				...entry,
-				get 'ratio(%)'() {
-					return round(100 * entry.downloads / sum, 1);
-				}
-			}
-		});
+	if (tavConfig) {
+		const range = getTestedVersionsFromTavConfig(name, tavConfig);
+		assert(semver.validRange(range), `Invalid range ${util.inspect(range)} for ${name}`);
+		return range;
+	}
+	const devDepVersion = packageJson.devDependencies[name];
+	if (devDepVersion) {
+		return devDepVersion;
+	}
+	// TODO: check out why is fastfy included as dep rather than devdep
+	const depVersion = packageJson.dependencies[name];
+	if (name === 'fastify' && depVersion) {
+		return depVersion;
+	}
+	assert.fail(`No tested version for ${name}`);
+};
 
-
-	const subset = filterStats(stats, { semverRange, showDeprecated: true });
-	const tableSum = sumDownloads(subset);
-
+const loadFiles = async (pluginRoot) => {
 	return {
-		sum,
-		subsetSum: tableSum,
-		supportedRatio: (100 * tableSum / sum).toFixed(2),
+		packageJson: await readJson(path.join(pluginRoot, 'package.json'))
+			.catch(eatError),
+		readme: await readFile(path.join(pluginRoot, 'README.md'), 'utf8')
+			.catch(eatError),
+	};
+};
+
+const loadPluginData = async (pluginRoot) => {
+	const pkgJsonPath = path.join(pluginRoot, 'package.json');
+	const files = await loadFiles(pluginRoot);
+	if (!files.packageJson) {
+		return { root: pluginRoot, files };
+	}
+	const tav = await checkTav(pluginRoot, files.packageJson);
+	const instrumentationName = files.packageJson?.name;
+	const name = should(instrumentationName, INSTRUMENTED_PACKAGE_NAME)
+		? getInstrumentedPackageName(instrumentationName, files.readme)
+		: undefined;
+
+	const stats = name ? await fetchStats(name) : undefined;
+	const supportedRange = should(instrumentationName, SUPPORTED_VERSIONS)
+		? getSupportedVersions(files.readme) : undefined;
+
+	// TODO: aws-sdk patches more than one package
+	const testedRange = supportedRange && getTestedVersions(name, files.packageJson, tav.config);
+	console.error(name, testedRange);
+	// console.log('supported', await supportedRange);
+	return {
+		root: pluginRoot,
+		files,
+		name,
+		instrumentationName,
+		testedRange,
+		// packageJson,
+		supportedRange,
+		tav,
 		stats,
 	};
 };
-const plugins = await Promise.all(
-	(await readdir(PLUGINS_DIR))
-		// .slice(3, 5)
-		.map(async (dir) => {
-			const root = path.resolve(PLUGINS_DIR, dir);
-			const pkgJsonPath = path.join(root, 'package.json');
-			const packageJson = await readJson(path.join(root, 'package.json'))
-				.catch((err) => {
-					console.error(err);
-					return null;
-				});
-			const instrumentationName = packageJson.name;
-			const readme = readFile(path.join(root, 'README.md'), 'utf8')
-				.catch((err) => {
-					console.error(err);
-					return null;
-				});
-			const supportedVersions = should(instrumentationName, SUPPORTED_VERSIONS)
-				? readme.then(getSupportedVersions) : undefined;
-			const tav = checkTav(root, packageJson);
-			const name = should(instrumentationName, INSTRUMENTED_PACKAGE_NAME)
-				? readme.then((readmeContents) => getInstrumentedPackageName(instrumentationName, readmeContents))
-				: undefined;
-			// TODO: aws-sdk patches more than one package
-			const versionStats = supportedVersions && name && should(instrumentationName, FETCH_STATS)
-				? Promise.all([name, supportedVersions]).then(([n, s]) => compileVersionStats(n, s))
-					.catch(async (err) => {
-						console.error(`Loading stats failed for ${await name}@${await supportedVersions}`);
-						throw err;
-					})
-				: undefined;
-			// console.log('supported', await supportedVersions);
-			return {
-				root,
-				name: await name,
-				versionStats: await versionStats,
-				instrumentationName,
-				// packageJson,
-				supportedVersions: await supportedVersions,
-				tav: await tav,
-			};
-		})
-);
 
-console.table(
-	plugins
-		// .slice(7, 11)
-		.map(({ name, versionStats: { supportedRatio } = {}, tav: { valid: tavValid }, supportedVersions, ...el }) => {
-			console.log('el', el);
-			return {
-				name,
-				supportedRatio,
-				tavValid,
-			};
-		})
-);
-
-
+export const loadPlugins = async (contribRoot) => {
+	const dirs = await readdir(contribRoot);
+	return Promise.all(
+		dirs
+			.map((dir) => {
+				return loadPluginData(path.resolve(contribRoot, dir));
+			})
+	);
+};
