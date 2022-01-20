@@ -54,6 +54,10 @@ const compileVersionStats = (plugin) => {
 	const tested = plugin.testedRange && subsetStats(stats, plugin.testedRange) || null;
 	const testedSupported = supported && tested && subsetStats(supported.subset, plugin.testedRange) || null;
 
+	console.log('supported', supported);
+	console.log('tested', tested);
+	console.log('testedSupported', testedSupported);
+
 	return {
 		stats,
 		sum,
@@ -121,7 +125,7 @@ const loadData = async (filename, reload = false) => {
 	if (!reload) {
 		return readJson(filename);
 	}
-	const data = (await loadPlugins(PLUGINS_DIR)).map(enhance.withCompiledStats)
+	const data = (await loadPlugins(PLUGINS_DIR)).map(enhance.withCompiledStats);
 
 	console.log(data);
 	writeJson(filename, data)
@@ -133,7 +137,7 @@ const loadData = async (filename, reload = false) => {
 const reload = !true;
 const filename = './data.json';
 
-const plugins = await loadData(filename, reload);
+const plugins = (await loadData(filename, reload));
 
 const show = plugins
 	.map(enhance.withScriptStats)
@@ -141,31 +145,76 @@ const show = plugins
 		return item.supportedRange;
 	});
 
-show.sort((a, b) => {
-	assert(a.stats, `stats not loaded: ${util.inspect(a)}`);
-	assert(b.stats, `stats not loaded: ${util.inspect(b)}`);
-	return a.stats.sum < b.stats.sum ? 1 : -1;
-});
+// show.sort((a, b) => {
+// 	assert(a.stats, `stats not loaded: ${util.inspect(a)}`);
+// 	assert(b.stats, `stats not loaded: ${util.inspect(b)}`);
+// 	return a.stats.sum < b.stats.sum ? 1 : -1;
+// });
 
-console.table(
-	show
-		.map((item) => {
-			// console.log(item);
-			const {
-				supportedRange,
-				testedRange,
-				name,
-				stats: { supportedRatio, testedRatio, testedSupportedRatio, sum } = {},
-				tav: { valid: tav },
-				...el
-			} = item;
-			// console.error(name, item.scripts);
-			return {
-				name,
-				sum: formatLarge(sum),
-			};
-		})
-);
+const benefitAnalysis = true;
+if (benefitAnalysis) {
+	const whichone = 'both';
+
+	const show2 = show.map((el) => {
+		el.tavBenefit = (el.stats.supported.sum * (100 - el.stats.testedSupportedRatio) / 100) >> 0;
+		// el.tavBenefit = `${round(100 - el.stats.testedSupportedRatio, 1)}% of ${el.stats.supported.sum}`;
+
+		el.supportMoreBenefit = (el.stats.sum * (100 - el.stats.supportedRatio) / 100) >> 0;
+		// el.supportMoreBenefit = `${round(100 - el.stats.supportedRatio, 1)}% of ${el.stats.sum}`;
+		return el;
+	});
+
+	if (whichone === 'tav') {
+		show2.sort((a, b) => {
+			assert(a.stats, `stats not loaded: ${util.inspect(a)}`);
+			assert(b.stats, `stats not loaded: ${util.inspect(b)}`);
+			return a.tavBenefit < b.tavBenefit ? 1 : -1;
+		});
+	} else if (whichone === 'both') {
+		show2.sort((a, b) => {
+			assert(a.stats, `stats not loaded: ${util.inspect(a)}`);
+			assert(b.stats, `stats not loaded: ${util.inspect(b)}`);
+			return Math.max(a.supportMoreBenefit, a.tavBenefit) < Math.max(b.supportMoreBenefit, b.tavBenefit) ? 1 : -1;
+		});
+	} else {
+		show2.sort((a, b) => {
+			assert(a.stats, `stats not loaded: ${util.inspect(a)}`);
+			assert(b.stats, `stats not loaded: ${util.inspect(b)}`);
+			return a.supportMoreBenefit < b.supportMoreBenefit ? 1 : -1;
+		});
+	}
+
+
+	console.table(
+		show2
+			.map((item) => {
+				// console.log(item);
+				const {
+					tavBenefit,
+					supportMoreBenefit,
+					supportedRange,
+					testedRange,
+					name,
+					stats: { supportedRatio, testedRatio, testedSupportedRatio, sum } = {},
+					tav: { valid: tav },
+					...el
+				} = item;
+				return {
+					name,
+					supportedRange,
+					testedRange: formatLongRange(testedRange),
+					'support%': supportedRatio,
+					'test/support%': testedSupportedRatio,
+					'test%': testedRatio,
+					// tav,
+					tavBenefit,
+					supportMoreBenefit,
+					sum: formatLarge(sum),
+				};
+			})
+	);
+	process.exit(0);
+}
 
 // console.table(
 // 	show
@@ -179,15 +228,35 @@ console.table(
 // 				tav: { valid: tav },
 // 				...el
 // 			} = item;
+// 			// console.error(name, item.scripts);
 // 			return {
 // 				name,
-// 				supportedRange,
-// 				testedRange: formatLongRange(testedRange),
-// 				'support%': supportedRatio,
-// 				'test/support%': testedSupportedRatio,
-// 				'test%': testedRatio,
-// 				tav,
 // 				sum: formatLarge(sum),
 // 			};
 // 		})
 // );
+
+console.table(
+	show
+		.map((item) => {
+			// console.log(item);
+			const {
+				supportedRange,
+				testedRange,
+				name,
+				stats: { supportedRatio, testedRatio, testedSupportedRatio, sum } = {},
+				tav: { valid: tav },
+				...el
+			} = item;
+			return {
+				name,
+				supportedRange,
+				testedRange: formatLongRange(testedRange),
+				'support%': supportedRatio,
+				'test/support%': testedSupportedRatio,
+				'test%': testedRatio,
+				tav,
+				sum: formatLarge(sum),
+			};
+		})
+);
